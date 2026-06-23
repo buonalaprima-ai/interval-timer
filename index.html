@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#111418">
+<title>Interval Timer</title>
+<style>
+  :root {
+    --bg: #111418;
+    --card: #1b2027;
+    --text: #f2f4f7;
+    --muted: #8a93a0;
+    --pausa: #3b82f6;
+    --corsa: #ef4444;
+    --accent: #22c55e;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    gap: 24px;
+    user-select: none;
+    transition: background-color .4s ease;
+  }
+  body.run-pausa { background: #0e1d33; }
+  body.run-corsa { background: #2a1213; }
+
+  h1 { font-size: 18px; font-weight: 600; color: var(--muted); margin: 0; letter-spacing: .5px; }
+
+  .setup { display: flex; gap: 16px; width: 100%; max-width: 420px; }
+  .field { flex: 1; background: var(--card); border-radius: 16px; padding: 16px; text-align: center; }
+  .field label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
+  .field .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .field input {
+    width: 100%; border: none; background: transparent; color: var(--text);
+    font-size: 34px; font-weight: 700; text-align: center; outline: none;
+  }
+  .field .unit { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+  .display { text-align: center; }
+  .phase { font-size: 22px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; height: 28px; }
+  .phase.pausa { color: var(--pausa); }
+  .phase.corsa { color: var(--corsa); }
+  .time { font-size: clamp(72px, 26vw, 140px); font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1.05; }
+  .round { font-size: 15px; color: var(--muted); height: 20px; }
+
+  .controls { width: 100%; max-width: 420px; }
+  button {
+    width: 100%; border: none; border-radius: 18px; padding: 22px;
+    font-size: 22px; font-weight: 700; color: #fff; cursor: pointer;
+    transition: transform .08s ease, background-color .2s ease;
+  }
+  button:active { transform: scale(.97); }
+  #startBtn { background: var(--accent); }
+  #startBtn.running { background: #4b5563; }
+
+  .hint { font-size: 12px; color: var(--muted); text-align: center; max-width: 420px; line-height: 1.5; }
+</style>
+</head>
+<body>
+  <h1>INTERVAL TIMER</h1>
+
+  <div class="setup" id="setup">
+    <div class="field">
+      <label><span class="dot" style="background:var(--pausa)"></span>Pausa</label>
+      <input id="pausa" type="number" inputmode="decimal" min="0" step="0.5" value="1">
+      <div class="unit">minuti</div>
+    </div>
+    <div class="field">
+      <label><span class="dot" style="background:var(--corsa)"></span>Corsa</label>
+      <input id="corsa" type="number" inputmode="decimal" min="0" step="0.5" value="2">
+      <div class="unit">minuti</div>
+    </div>
+  </div>
+
+  <div class="display">
+    <div class="phase" id="phaseLabel"></div>
+    <div class="time" id="time">00:00</div>
+    <div class="round" id="round"></div>
+  </div>
+
+  <div class="controls">
+    <button id="startBtn">Avvia</button>
+  </div>
+
+  <div class="hint">
+    Funziona anche a schermo bloccato / in tasca.<br>
+    Su iPhone: <b>Condividi → Aggiungi a Home</b> per usarlo come app.
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+  const pausaInput = $("pausa");
+  const corsaInput = $("corsa");
+  const startBtn = $("startBtn");
+  const phaseLabel = $("phaseLabel");
+  const timeEl = $("time");
+  const roundEl = $("round");
+  const setupEl = $("setup");
+
+  const SR = 8000; // sample rate: i beep stanno bene anche a 8 kHz
+
+  let running = false;
+  let startTime = 0;     // Date.now() all'avvio
+  let pausaMs = 0;
+  let corsaMs = 0;
+  let cycleMs = 0;
+  let tickHandle = null;
+  let wakeLock = null;
+
+  // Elemento audio riutilizzato (la traccia in loop = la "sveglia")
+  const audio = new Audio();
+  audio.loop = true;
+  audio.preload = "auto";
+  let currentUrl = null;
+
+  // ---------------------------------------------------------------
+  // Generazione della traccia WAV: un ciclo completo (pausa+corsa)
+  // con i due beep ai punti giusti. In loop suona all'infinito,
+  // e iOS la tiene viva anche a schermo bloccato.
+  // ---------------------------------------------------------------
+  function renderTone(buf, startIdx, freq, durSec, amp) {
+    const n = Math.floor(durSec * SR);
+    const atk = Math.min(40, Math.floor(n * 0.1));
+    const rel = Math.min(160, Math.floor(n * 0.35));
+    for (let i = 0; i < n; i++) {
+      let env = 1;
+      if (i < atk) {
+        env = i / atk;
+      } else if (i > n - rel) {
+        env = (n - i) / rel;
+      }
+      const idx = startIdx + i;
+      if (idx >= 0 && idx < buf.length) {
+        const s = Math.sin(2 * Math.PI * freq * i / SR) * amp * env;
+        buf[idx] = Math.max(-32767, Math.min(32767, Math.round(s * 32767)));
+      }
+    }
+  }
+
+  function buildCycleBlob(pSec, cSec) {
+    const total = Math.max(SR, Math.round((pSec + cSec) * SR));
+    const buf = new Int16Array(total); // silenzio = zeri
+
+    // Beep A — inizio CORSA (tripla salita acuta), a t = pausa
+    const a = Math.round(pSec * SR);
+    renderTone(buf, a, 660, 0.14, 0.85);
+    renderTone(buf, a + Math.round(0.16 * SR), 880, 0.14, 0.85);
+    renderTone(buf, a + Math.round(0.32 * SR), 1175, 0.22, 0.9);
+
+    // Beep B — inizio PAUSA (doppia discesa grave), in chiusura ciclo
+    const b = total - Math.round(0.55 * SR);
+    renderTone(buf, b, 523, 0.2, 0.85);
+    renderTone(buf, b + Math.round(0.24 * SR), 349, 0.3, 0.85);
+
+    // Header WAV (PCM 16-bit mono)
+    const dataSize = buf.length * 2;
+    const ab = new ArrayBuffer(44 + dataSize);
+    const dv = new DataView(ab);
+    const wstr = (off, s) => { for (let i = 0; i < s.length; i++) { dv.setUint8(off + i, s.charCodeAt(i)); } };
+    wstr(0, "RIFF"); dv.setUint32(4, 36 + dataSize, true); wstr(8, "WAVE");
+    wstr(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true);
+    dv.setUint16(22, 1, true); dv.setUint32(24, SR, true); dv.setUint32(28, SR * 2, true);
+    dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+    wstr(36, "data"); dv.setUint32(40, dataSize, true);
+    for (let i = 0; i < buf.length; i++) {
+      dv.setInt16(44 + i * 2, buf[i], true);
+    }
+    return new Blob([ab], { type: "audio/wav" });
+  }
+
+  // ---- Wake Lock (extra, per quando si tiene lo schermo acceso) ----
+  async function acquireWakeLock() {
+    try {
+      if ("wakeLock" in navigator) {
+        wakeLock = await navigator.wakeLock.request("screen");
+      }
+    } catch (e) { /* ignora */ }
+  }
+  function releaseWakeLock() {
+    if (wakeLock) {
+      wakeLock.release().catch(() => {});
+      wakeLock = null;
+    }
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (running && document.visibilityState === "visible" && !wakeLock) {
+      acquireWakeLock();
+    }
+  });
+
+  // ---- Helpers ----
+  function minutes(input) {
+    const v = parseFloat(String(input.value).replace(",", "."));
+    return isNaN(v) || v < 0 ? 0 : v;
+  }
+
+  function render() {
+    const elapsed = Date.now() - startTime;
+    const pos = elapsed % cycleMs;
+    let phase, remaining;
+    if (pos < pausaMs) {
+      phase = "pausa";
+      remaining = pausaMs - pos;
+    } else {
+      phase = "corsa";
+      remaining = cycleMs - pos;
+    }
+    const totalSec = Math.ceil(remaining / 1000);
+    const mm = String(Math.floor(totalSec / 60)).padStart(2, "0");
+    const ss = String(totalSec % 60).padStart(2, "0");
+    timeEl.textContent = mm + ":" + ss;
+    phaseLabel.textContent = phase === "pausa" ? "Pausa" : "Corsa";
+    phaseLabel.className = "phase " + phase;
+    roundEl.textContent = "Giro " + (Math.floor(elapsed / cycleMs) + 1);
+    document.body.className = "run-" + phase;
+  }
+
+  function start() {
+    const pSec = minutes(pausaInput) * 60;
+    const cSec = minutes(corsaInput) * 60;
+    if (pSec + cSec < 1) {
+      return;
+    }
+
+    pausaMs = pSec * 1000;
+    corsaMs = cSec * 1000;
+    cycleMs = pausaMs + corsaMs;
+
+    // Costruisci e avvia la traccia in loop (dentro il gesto del tap → iOS la consente)
+    if (currentUrl) {
+      URL.revokeObjectURL(currentUrl);
+    }
+    currentUrl = URL.createObjectURL(buildCycleBlob(pSec, cSec));
+    audio.src = currentUrl;
+    audio.currentTime = 0;
+    audio.play().catch(() => {});
+
+    acquireWakeLock();
+    running = true;
+    startTime = Date.now();
+    startBtn.textContent = "Ferma";
+    startBtn.classList.add("running");
+    setupEl.style.opacity = "0.4";
+    setupEl.style.pointerEvents = "none";
+    render();
+    tickHandle = setInterval(render, 200);
+  }
+
+  function stop() {
+    running = false;
+    if (tickHandle) {
+      clearInterval(tickHandle);
+      tickHandle = null;
+    }
+    audio.pause();
+    releaseWakeLock();
+    startBtn.textContent = "Avvia";
+    startBtn.classList.remove("running");
+    setupEl.style.opacity = "1";
+    setupEl.style.pointerEvents = "auto";
+    phaseLabel.textContent = "";
+    phaseLabel.className = "phase";
+    roundEl.textContent = "";
+    timeEl.textContent = "00:00";
+    document.body.className = "";
+  }
+
+  startBtn.addEventListener("click", () => {
+    if (running) {
+      stop();
+    } else {
+      start();
+    }
+  });
+})();
+</script>
+</body>
+</html>
