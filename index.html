@@ -191,15 +191,16 @@
     }
 
     // --- Allarme "PAUSA" (inizio recupero): ding-dong in discesa, ripetuto 2× ---
+    // Va all'INIZIO del buffer (= bordo del loop), così il suo ONSET coincide
+    // con lo zero della corsa, esattamente come il "VIA" coincide con lo zero
+    // della pausa. Niente più anticipo.
     const rest = [
       { at: 0.00, f: 1568, d: 0.18 },
       { at: 0.22, f: 1175, d: 0.34 }
     ];
     const restRep = 0.66;
-    const restTotal = restRep + 0.56; // 2 ripetizioni
-    const restStart = (total / SR) - restTotal - 0.05; // piccolo margine dal bordo loop
     for (let r = 0; r < 2; r++) {
-      renderSeq(buf, restStart + r * restRep, rest, amp);
+      renderSeq(buf, r * restRep, rest, amp);
     }
 
     // --- Header WAV (PCM 16-bit mono, little-endian) ---
