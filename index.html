@@ -115,7 +115,8 @@
 
   let running = false;
   let roundCount = 1;    // giro corrente (best-effort, contato a schermo acceso)
-  let lastPos = 0;       // ultima posizione audio letta, per rilevare il loop
+  let lastPos = -1;      // ultimo tempo-fase letto, per rilevare il nuovo giro
+  let rotMs = 0;         // rotazione del buffer: scarto tra posizione audio e tempo-fase
   let pausaMs = 0;
   let corsaMs = 0;
   let cycleMs = 0;
@@ -166,41 +167,65 @@
     }
   }
 
-  // Piazza una sequenza di note (offset/freq/durata in secondi) a partire da startSec.
-  function renderSeq(buf, startSec, notes, amp) {
-    for (let i = 0; i < notes.length; i++) {
-      const note = notes[i];
-      renderTone(buf, Math.round((startSec + note.at) * SR), note.f, note.d, amp);
-    }
-  }
-
   function buildCycleBlob(pSec, cSec) {
     const total = Math.max(SR, Math.round((pSec + cSec) * SR));
+    const cycleSec = total / SR;
     const buf = new Int16Array(total); // silenzio = zeri
     const amp = 0.98;
 
-    // --- Allarme "VIA" (inizio CORSA): tripletta acuta in salita, ripetuta 3× ---
+    // Allarme "VIA" (inizio CORSA): tripletta acuta in salita, ripetuta 3×
     const go = [
       { at: 0.00, f: 1318, d: 0.10 },
       { at: 0.12, f: 1568, d: 0.10 },
       { at: 0.24, f: 1865, d: 0.18 }
     ];
-    const goRep = 0.46; // durata di una ripetizione + pausetta
-    for (let r = 0; r < 3; r++) {
-      renderSeq(buf, pSec + r * goRep, go, amp);
-    }
+    const goRep = 0.46;
+    const goDur = 3 * goRep; // durata occupata dal "VIA" dal suo onset
 
-    // --- Allarme "PAUSA" (inizio recupero): ding-dong in discesa, ripetuto 2× ---
-    // Va all'INIZIO del buffer (= bordo del loop), così il suo ONSET coincide
-    // con lo zero della corsa, esattamente come il "VIA" coincide con lo zero
-    // della pausa. Niente più anticipo.
+    // Allarme "PAUSA" (inizio recupero): ding-dong in discesa, ripetuto 2×
     const rest = [
       { at: 0.00, f: 1568, d: 0.18 },
       { at: 0.22, f: 1175, d: 0.34 }
     ];
     const restRep = 0.66;
+    const restDur = 2 * restRep; // durata occupata dalla "PAUSA" dal suo onset
+
+    // Il bordo del loop di <audio> su Safari ha una micrososta che ritarda ciò
+    // che gli sta sopra. Lo posizioniamo in MEZZO al silenzio più lungo, lontano
+    // da entrambi gli allarmi: così la micrososta cade nel silenzio e nessun beep
+    // viene ritardato. rotSec = tempo-fase a cui corrisponde l'inizio del buffer.
+    const gapC = cSec - goDur;   // silenzio dentro la corsa
+    const gapP = pSec - restDur; // silenzio dentro la pausa
+    let rotSec;
+    if (gapC >= gapP && gapC > 0.4) {
+      rotSec = pSec + goDur + gapC / 2;
+    } else if (gapP > 0.4) {
+      rotSec = restDur + gapP / 2;
+    } else {
+      rotSec = 0; // fasi troppo corte per nascondere la micrososta
+    }
+    rotMs = rotSec * 1000;
+
+    // Tempo-fase (s) → indice nel buffer ruotato
+    const idxOf = (phaseSec) => {
+      let t = (phaseSec - rotSec) % cycleSec;
+      if (t < 0) {
+        t += cycleSec;
+      }
+      return Math.round(t * SR);
+    };
+    const place = (onsetSec, notes) => {
+      for (let i = 0; i < notes.length; i++) {
+        renderTone(buf, idxOf(onsetSec + notes[i].at), notes[i].f, notes[i].d, amp);
+      }
+    };
+
+    // VIA all'inizio della corsa (tempo-fase = pSec); PAUSA all'inizio della pausa (= 0)
+    for (let r = 0; r < 3; r++) {
+      place(pSec + r * goRep, go);
+    }
     for (let r = 0; r < 2; r++) {
-      renderSeq(buf, r * restRep, rest, amp);
+      place(r * restRep, rest);
     }
 
     // --- Header WAV (PCM 16-bit mono, little-endian) ---
@@ -243,25 +268,26 @@
   }
 
   function render() {
-    // L'AUDIO è l'orologio di riferimento: leggo la posizione nel ciclo da lì,
-    // così la UI e i beep restano sempre allineati (stessa sorgente di tempo).
-    let pos = audio.currentTime * 1000;
-    if (!isFinite(pos) || pos < 0) {
-      pos = 0;
+    // L'AUDIO è l'orologio di riferimento. Il buffer è "ruotato" (il bordo del
+    // loop sta in mezzo a un silenzio), quindi riporto la posizione del buffer al
+    // tempo-fase reale aggiungendo rotMs. Così UI e beep restano allineati.
+    let tau = (audio.currentTime * 1000 + rotMs) % cycleMs;
+    if (!isFinite(tau) || tau < 0) {
+      tau = 0;
     }
-    // Rilevo il "giro" quando l'audio torna a inizio loop (best-effort, a schermo acceso)
-    if (pos + 50 < lastPos) {
+    // Nuovo giro quando il tempo-fase rientra (passa per lo zero della pausa)
+    if (lastPos >= 0 && tau + 50 < lastPos) {
       roundCount++;
     }
-    lastPos = pos;
+    lastPos = tau;
 
     let phase, remaining;
-    if (pos < pausaMs) {
+    if (tau < pausaMs) {
       phase = "pausa";
-      remaining = pausaMs - pos;
+      remaining = pausaMs - tau;
     } else {
       phase = "corsa";
-      remaining = cycleMs - pos;
+      remaining = cycleMs - tau;
     }
     const totalSec = Math.ceil(remaining / 1000);
     const mm = String(Math.floor(totalSec / 60)).padStart(2, "0");
@@ -284,19 +310,32 @@
     corsaMs = cSec * 1000;
     cycleMs = pausaMs + corsaMs;
 
-    // Costruisci e avvia la traccia in loop (dentro il gesto del tap → iOS la consente)
+    // Costruisci la traccia (imposta anche rotMs) e avviala in loop dentro il gesto
+    // del tap → iOS la consente.
     if (currentUrl) {
       URL.revokeObjectURL(currentUrl);
     }
     currentUrl = URL.createObjectURL(buildCycleBlob(pSec, cSec));
     audio.src = currentUrl;
-    audio.currentTime = 0;
-    audio.play().catch(() => {});
+
+    // Partenza dal tempo-fase 0 (inizio pausa). Prima di quel punto il buffer è
+    // silenzio, quindi un eventuale ritardo del seek non genera glitch udibili.
+    const startAtSec = ((cycleMs - rotMs) % cycleMs) / 1000;
+    const seekToStart = () => {
+      try {
+        audio.currentTime = startAtSec;
+      } catch (e) { /* ignora */ }
+    };
+    audio.currentTime = startAtSec;
+    const playPromise = audio.play();
+    if (playPromise && playPromise.then) {
+      playPromise.then(seekToStart).catch(seekToStart);
+    }
 
     acquireWakeLock();
     running = true;
     roundCount = 1;
-    lastPos = 0;
+    lastPos = -1;
     startBtn.textContent = "Ferma";
     startBtn.classList.add("running");
     setupEl.style.opacity = "0.4";
