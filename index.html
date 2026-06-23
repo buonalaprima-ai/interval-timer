@@ -114,7 +114,8 @@
   const SR = 8000; // sample rate: i beep stanno bene anche a 8 kHz
 
   let running = false;
-  let startTime = 0;     // Date.now() all'avvio
+  let roundCount = 1;    // giro corrente (best-effort, contato a schermo acceso)
+  let lastPos = 0;       // ultima posizione audio letta, per rilevare il loop
   let pausaMs = 0;
   let corsaMs = 0;
   let cycleMs = 0;
@@ -209,8 +210,18 @@
   }
 
   function render() {
-    const elapsed = Date.now() - startTime;
-    const pos = elapsed % cycleMs;
+    // L'AUDIO è l'orologio di riferimento: leggo la posizione nel ciclo da lì,
+    // così la UI e i beep restano sempre allineati (stessa sorgente di tempo).
+    let pos = audio.currentTime * 1000;
+    if (!isFinite(pos) || pos < 0) {
+      pos = 0;
+    }
+    // Rilevo il "giro" quando l'audio torna a inizio loop (best-effort, a schermo acceso)
+    if (pos + 50 < lastPos) {
+      roundCount++;
+    }
+    lastPos = pos;
+
     let phase, remaining;
     if (pos < pausaMs) {
       phase = "pausa";
@@ -225,7 +236,7 @@
     timeEl.textContent = mm + ":" + ss;
     phaseLabel.textContent = phase === "pausa" ? "Pausa" : "Corsa";
     phaseLabel.className = "phase " + phase;
-    roundEl.textContent = "Giro " + (Math.floor(elapsed / cycleMs) + 1);
+    roundEl.textContent = "Giro " + roundCount;
     document.body.className = "run-" + phase;
   }
 
@@ -251,7 +262,8 @@
 
     acquireWakeLock();
     running = true;
-    startTime = Date.now();
+    roundCount = 1;
+    lastPos = 0;
     startBtn.textContent = "Ferma";
     startBtn.classList.add("running");
     setupEl.style.opacity = "0.4";
