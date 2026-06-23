@@ -111,7 +111,7 @@
   const roundEl = $("round");
   const setupEl = $("setup");
 
-  const SR = 8000; // sample rate: i beep stanno bene anche a 8 kHz
+  const SR = 11025; // sample rate (più alto = beep più ricchi e udibili)
 
   let running = false;
   let roundCount = 1;    // giro corrente (best-effort, contato a schermo acceso)
@@ -133,10 +133,19 @@
   // con i due beep ai punti giusti. In loop suona all'infinito,
   // e iOS la tiene viva anche a schermo bloccato.
   // ---------------------------------------------------------------
+  // Tono "ricco" di armoniche: molto più udibile di una sinusoide pura a parità
+  // di volume. Le armoniche sono limitate sotto Nyquist per evitare aliasing.
   function renderTone(buf, startIdx, freq, durSec, amp) {
     const n = Math.floor(durSec * SR);
-    const atk = Math.min(40, Math.floor(n * 0.1));
-    const rel = Math.min(160, Math.floor(n * 0.35));
+    const atk = Math.min(120, Math.floor(n * 0.08));
+    const rel = Math.min(220, Math.floor(n * 0.22));
+    const nyquist = SR / 2;
+    const harmonics = [];
+    let norm = 0;
+    for (let k = 1; k <= 6 && k * freq < nyquist; k++) {
+      harmonics.push(k);
+      norm += 1 / k;
+    }
     for (let i = 0; i < n; i++) {
       let env = 1;
       if (i < atk) {
@@ -144,43 +153,66 @@
       } else if (i > n - rel) {
         env = (n - i) / rel;
       }
+      let s = 0;
+      for (let h = 0; h < harmonics.length; h++) {
+        const k = harmonics[h];
+        s += Math.sin(2 * Math.PI * freq * k * i / SR) / k;
+      }
+      s = (s / norm) * amp * env;
       const idx = startIdx + i;
       if (idx >= 0 && idx < buf.length) {
-        const s = Math.sin(2 * Math.PI * freq * i / SR) * amp * env;
         buf[idx] = Math.max(-32767, Math.min(32767, Math.round(s * 32767)));
       }
+    }
+  }
+
+  // Piazza una sequenza di note (offset/freq/durata in secondi) a partire da startSec.
+  function renderSeq(buf, startSec, notes, amp) {
+    for (let i = 0; i < notes.length; i++) {
+      const note = notes[i];
+      renderTone(buf, Math.round((startSec + note.at) * SR), note.f, note.d, amp);
     }
   }
 
   function buildCycleBlob(pSec, cSec) {
     const total = Math.max(SR, Math.round((pSec + cSec) * SR));
     const buf = new Int16Array(total); // silenzio = zeri
+    const amp = 0.98;
 
-    // Beep A — inizio CORSA (tripla salita acuta), a t = pausa
-    const a = Math.round(pSec * SR);
-    renderTone(buf, a, 660, 0.14, 0.85);
-    renderTone(buf, a + Math.round(0.16 * SR), 880, 0.14, 0.85);
-    renderTone(buf, a + Math.round(0.32 * SR), 1175, 0.22, 0.9);
+    // --- Allarme "VIA" (inizio CORSA): tripletta acuta in salita, ripetuta 3× ---
+    const go = [
+      { at: 0.00, f: 1318, d: 0.10 },
+      { at: 0.12, f: 1568, d: 0.10 },
+      { at: 0.24, f: 1865, d: 0.18 }
+    ];
+    const goRep = 0.46; // durata di una ripetizione + pausetta
+    for (let r = 0; r < 3; r++) {
+      renderSeq(buf, pSec + r * goRep, go, amp);
+    }
 
-    // Beep B — inizio PAUSA (doppia discesa grave), in chiusura ciclo
-    const b = total - Math.round(0.55 * SR);
-    renderTone(buf, b, 523, 0.2, 0.85);
-    renderTone(buf, b + Math.round(0.24 * SR), 349, 0.3, 0.85);
+    // --- Allarme "PAUSA" (inizio recupero): ding-dong in discesa, ripetuto 2× ---
+    const rest = [
+      { at: 0.00, f: 1568, d: 0.18 },
+      { at: 0.22, f: 1175, d: 0.34 }
+    ];
+    const restRep = 0.66;
+    const restTotal = restRep + 0.56; // 2 ripetizioni
+    const restStart = (total / SR) - restTotal - 0.05; // piccolo margine dal bordo loop
+    for (let r = 0; r < 2; r++) {
+      renderSeq(buf, restStart + r * restRep, rest, amp);
+    }
 
-    // Header WAV (PCM 16-bit mono)
+    // --- Header WAV (PCM 16-bit mono, little-endian) ---
     const dataSize = buf.length * 2;
-    const ab = new ArrayBuffer(44 + dataSize);
-    const dv = new DataView(ab);
+    const header = new ArrayBuffer(44);
+    const dv = new DataView(header);
     const wstr = (off, s) => { for (let i = 0; i < s.length; i++) { dv.setUint8(off + i, s.charCodeAt(i)); } };
     wstr(0, "RIFF"); dv.setUint32(4, 36 + dataSize, true); wstr(8, "WAVE");
     wstr(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true);
     dv.setUint16(22, 1, true); dv.setUint32(24, SR, true); dv.setUint32(28, SR * 2, true);
     dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
     wstr(36, "data"); dv.setUint32(40, dataSize, true);
-    for (let i = 0; i < buf.length; i++) {
-      dv.setInt16(44 + i * 2, buf[i], true);
-    }
-    return new Blob([ab], { type: "audio/wav" });
+    return new Blob([header, buf.buffer], { type: "audio/wav" });
   }
 
   // ---- Wake Lock (extra, per quando si tiene lo schermo acceso) ----
